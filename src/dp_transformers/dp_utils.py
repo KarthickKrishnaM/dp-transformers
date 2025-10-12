@@ -8,9 +8,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import (
-    Trainer, TrainerCallback, TrainerState, TrainerControl, logging,
+    TrainerCallback, TrainerState, TrainerControl, logging,
     DataCollatorForLanguageModeling, PreTrainedTokenizer, training_args, modeling_utils
 )
+from dp_transformers.custom_trainer import Trainer
 from transformers.file_utils import is_sagemaker_mp_enabled, is_datasets_available
 import opacus
 from opacus.accountants import RDPAccountant
@@ -19,7 +20,9 @@ from contextlib import contextmanager
 from typing import Any, Callable, List, Optional, Union, Dict, Sequence
 from accelerate.optimizer import AcceleratedOptimizer
 
-from dp_transformers import sampler, arguments
+from dp_transformers import sampler, arguments, custom_dp_optimizer, custom_ddp_optimizer
+from torch.utils.data import default_collate
+
 
 logger = logging.get_logger(__name__)
 
@@ -33,21 +36,21 @@ class DPCallback(TrainerCallback):
         noise_multiplier: float,
         target_delta: float,
         sampling_probability: float,
-        rdp_accountant: RDPAccountant,
-        prv_accountant: PRVAccountant,
+        # rdp_accountant: RDPAccountant,
+        # prv_accountant: PRVAccountant,
         max_epsilon: float = float('inf')
     ) -> None:
 
         self.noise_multiplier = noise_multiplier
         self.target_delta = target_delta
         self.sampling_probability = sampling_probability
-        self.rdp_accountant = rdp_accountant
-        self.prv_accountant = prv_accountant
+        # self.rdp_accountant = rdp_accountant
+        # self.prv_accountant = prv_accountant
 
         self.max_epsilon = max_epsilon
         self.on_substep_end_was_called = False
-        self.compute_rdp_epsilon = lambda: self.rdp_accountant.get_epsilon(self.target_delta)
-        self.compute_prv_epsilon = lambda s: self.prv_accountant.compute_epsilon(s)[2]
+        # self.compute_rdp_epsilon = lambda: self.rdp_accountant.get_epsilon(self.target_delta)
+        # self.compute_prv_epsilon = lambda s: self.prv_accountant.compute_epsilon(s)[2]
 
     def on_substep_end(self, args: training_args.TrainingArguments, state: TrainerState, control: TrainerControl, optimizer=None, **kwargs):
         if optimizer is None:
@@ -56,7 +59,7 @@ class DPCallback(TrainerCallback):
             dp_optimizer = optimizer.optimizer
         else:
             dp_optimizer = optimizer
-        dp_optimizer.signal_skip_step(do_skip=True)
+        
         dp_optimizer.step()
         dp_optimizer.zero_grad()
 
@@ -77,21 +80,21 @@ class DPCallback(TrainerCallback):
             raise RuntimeError("Impossible to access optimizer from inside callback")
         optimizer.zero_grad()  # Opacus is bothered that HF does not call .zero_grad() on the optimizer
 
-        self.rdp_accountant.step(noise_multiplier=self.noise_multiplier, sample_rate=self.sampling_probability)
+        # self.rdp_accountant.step(noise_multiplier=self.noise_multiplier, sample_rate=self.sampling_probability)
 
-    def on_save(self, args: training_args.TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        return self._check_max_epsilon_exceeded(state, control)
+    # def on_save(self, args: training_args.TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+    #     return self._check_max_epsilon_exceeded(state, control)
 
-    def on_evaluate(self, args: training_args.TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        return self._check_max_epsilon_exceeded(state, control)
+    # def on_evaluate(self, args: training_args.TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+    #     return self._check_max_epsilon_exceeded(state, control)
 
-    def _check_max_epsilon_exceeded(self, state: TrainerState, control: TrainerControl) -> TrainerControl:
-        eps_rdp = self.compute_rdp_epsilon()
-        eps_prv = self.compute_prv_epsilon(state.global_step)
-        if eps_rdp > self.max_epsilon or eps_prv > self.max_epsilon:
-            logger.error("Max epsilon exceeded. Stopping training...")
-            control.should_training_stop = True
-        return control
+    # def _check_max_epsilon_exceeded(self, state: TrainerState, control: TrainerControl) -> TrainerControl:
+    #     eps_rdp = self.compute_rdp_epsilon()
+    #     eps_prv = self.compute_prv_epsilon(state.global_step)
+    #     if eps_rdp > self.max_epsilon or eps_prv > self.max_epsilon:
+    #         logger.error("Max epsilon exceeded. Stopping training...")
+    #         control.should_training_stop = True
+    #     return control
 
 
 class DataCollatorForPrivateCausalLanguageModeling(DataCollatorForLanguageModeling):
@@ -132,7 +135,6 @@ def create_author_mapping(dataset: Dataset, author: str) -> Sequence[Sequence[in
         author_mapping = [g.index.values for _, g in authors.groupby("author")]
     return author_mapping
 
-
 class OpacusDPTrainer(Trainer):
     """
     Wrapper to modify Huggingface Trainer to:
@@ -153,6 +155,7 @@ class OpacusDPTrainer(Trainer):
     ) -> None:
 
         self.train_args = args
+        self.user_grad_acc = self.train_args.gradient_accumulation_steps
         self.privacy_args = privacy_args
 
         # Sample-level DP is equivalent to mapping each sample to a unique author. 
@@ -171,36 +174,37 @@ class OpacusDPTrainer(Trainer):
         if args.parallel_mode == training_args.ParallelMode.DISTRIBUTED:
             logger.info(f"Wrapping the model with DPDDP in distributed training.")
             model = opacus.distributed.DifferentiallyPrivateDistributedDataParallel(model)
-
-        model = GradSampleModule(model)
+        
+        model = GradSampleModule(model)  #makes sure model.parameters has the grad_sample attribute
 
         # Instantiate privacy accountants
-        self.rdp_accountant = RDPAccountant()
-        self.prv_accountant = PRVAccountant(
-            noise_multiplier=self.privacy_args.noise_multiplier,
-            sampling_probability=self.sampling_probability,
-            delta=self.privacy_args.target_delta,
-            eps_error=0.1,
-            max_compositions=self.num_steps
-        )
+        # self.rdp_accountant = RDPAccountant()
+        # self.prv_accountant = PRVAccountant(
+        #     noise_multiplier=self.privacy_args.noise_multiplier,
+        #     sampling_probability=self.sampling_probability,
+        #     delta=self.privacy_args.target_delta,
+        #     eps_error=0.1,
+        #     max_compositions=self.num_steps
+        # )
 
         # Set up callback for accounting and handling grad acc
         self.dp_callback = DPCallback(
             noise_multiplier=self.privacy_args.noise_multiplier,
             target_delta=self.privacy_args.target_delta,
             sampling_probability=self.sampling_probability,
-            rdp_accountant=self.rdp_accountant,
-            prv_accountant=self.prv_accountant
+            # rdp_accountant=self.rdp_accountant,
+            # prv_accountant=self.prv_accountant
         )
+        args.gradient_accumulation_steps = 1
         super().__init__(model=model, args=args, train_dataset=train_dataset, callbacks=[self.dp_callback], **kwargs)
+        self._accumulated_grad_samples = None  # will be list of tensors per param or None
 
-        self.get_rdp_epsilon = lambda: self.rdp_accountant.get_epsilon(self.privacy_args.target_delta)  # RDP epsilon
-        self.get_prv_epsilon = lambda: self.prv_accountant.compute_epsilon(self.state.global_step)[2]
+        # self.get_rdp_epsilon = lambda: self.rdp_accountant.get_epsilon(self.privacy_args.target_delta)  # RDP epsilon
+        # self.get_prv_epsilon = lambda: self.prv_accountant.compute_epsilon(self.state.global_step)[2]
 
     @property
     def sampling_probability(self) -> float:
-        return self.train_args.per_device_train_batch_size * self.train_args.world_size * \
-            self.train_args.gradient_accumulation_steps / len(self.author_mapping)
+        return self.train_args.per_device_train_batch_size * self.train_args.world_size  / len(self.author_mapping)
 
     @property
     def num_steps(self) -> int:
@@ -210,20 +214,122 @@ class OpacusDPTrainer(Trainer):
         _ = super().create_optimizer()
 
         if self.args.parallel_mode == training_args.ParallelMode.DISTRIBUTED:
-            optimizer_generator = opacus.optimizers.DistributedDPOptimizer
+            optimizer_generator = custom_ddp_optimizer.DistributedDPOptimizer
+
         else:
-            optimizer_generator = opacus.optimizers.DPOptimizer
+            optimizer_generator = custom_dp_optimizer.DPOptimizer
 
         self.optimizer = optimizer_generator(
             optimizer=self.optimizer,
             noise_multiplier=self.privacy_args.noise_multiplier,
             max_grad_norm=self.privacy_args.per_sample_max_grad_norm,
-            expected_batch_size=self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps,
+            expected_batch_size=self.args.per_device_train_batch_size,
+            selective_dp=self.privacy_args.selective_dp,
+            gradient_accumulation_steps=self.train_args.gradient_accumulation_steps, #still actual gradient_acc steps
         )
 
         return self.optimizer
+    
+    def clip(self, grad_sample, max_norm, batch_size):
+        # filter out None
+        valid_grads = [g for g in grad_sample if g is not None]
+        if len(valid_grads) == 0:
+            return grad_sample
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        per_param_norms = []
+
+        for g in grad_sample:
+            if g is None:
+                continue
+            else:
+                # already per-sample
+                per_param_norms.append(g.view(batch_size, -1).norm(2, dim=1) ** 2)
+
+        # aggregate norm
+        total_norm = torch.stack(per_param_norms).sum(dim=0).sqrt()  # [B]
+        factors = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+
+        # now clip
+        clipped = []
+        for g in grad_sample:
+            if g is None:
+                clipped.append(None)
+                continue
+            else:
+                clipped.append(g * factors.view(-1, *([1] * (g.dim() - 1))))
+
+        return clipped
+
+    
+    def _split_batch(self, inputs, num_microbatches: int):
+        """
+        Splits a batch (dict of tensors or tensor) into `num_microbatches`
+        along the first (batch) dimension.
+
+        Args:
+            inputs: batch from dataloader (can be a dict, tuple, or tensor).
+            num_microbatches: number of microbatches to create.
+
+        Returns:
+            A list of microbatches, each shaped consistently.
+        """
+
+        if num_microbatches == 1:
+            return [inputs]
+
+        # get batch size
+        if isinstance(inputs, dict):
+            batch_size = next(iter(inputs.values())).size(0)
+        elif isinstance(inputs, (list, tuple)):
+            batch_size = inputs[0].size(0)
+        else:  # Tensor
+            batch_size = inputs.size(0)
+
+        microbatch_size = (batch_size + num_microbatches - 1) // num_microbatches
+        microbatches = []
+
+        for start in range(0, batch_size, microbatch_size):
+            end = min(start + microbatch_size, batch_size)
+            if isinstance(inputs, dict):
+                mb = {k: v[start:end] for k, v in inputs.items()}
+            elif isinstance(inputs, (list, tuple)):
+                mb = [x[start:end] for x in inputs]
+            else:
+                mb = inputs[start:end]
+            microbatches.append(mb)
+
+        return microbatches
+    
+    def _init_accumulation_buffers(self, model):
+        """Create empty buffers matching the model.parameters() structure."""
+        params = list(model.parameters())
+        self._accumulated_grad_samples = [None for _ in params]
+
+    def _clear_accumulation_buffers(self):
+        self._accumulated_grad_samples = None
+    
+    def _accumulate_grad_samples(self, model):
+        """
+        Instead of concatenating per-sample gradients across microbatches,
+        we simply sum them into the accumulation buffer. At the end, we divide
+        by the number of microbatches (user_grad_accum) to get the average.
+        """
+        for i, p in enumerate(model.parameters()):
+            if not hasattr(p, "grad_sample") or p.grad_sample is None:
+                continue
+
+            if self._accumulated_grad_samples[i] is None:
+                # Initialize buffer with the first microbatch
+                self._accumulated_grad_samples[i] = p.grad_sample.detach().clone()
+            else:
+                # Sum the gradients across microbatches
+                self._accumulated_grad_samples[i] += p.grad_sample.detach()
+
+            # Clear grad_sample to avoid double counting in next microbatch
+            p.grad_sample = None
+
+        
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
 
@@ -242,27 +348,123 @@ class OpacusDPTrainer(Trainer):
             :obj:`torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
-        inputs = self._prepare_inputs(inputs)
 
-        if is_sagemaker_mp_enabled():
-            raise NotImplementedError("DP currently doesn't support this")
+        microbatches = self._split_batch(inputs, self.user_grad_acc)
+        self._init_accumulation_buffers(model)
 
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
+        total_loss = 0.0
+        for inputs in microbatches:
+            for name, param in model.named_parameters():
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    print(f"nan param {name}")
+            inputs = self._prepare_inputs(inputs)
+            microbatch_size = inputs["labels"].shape[0]
+            # pub_inputs = dict()
+            # for k, v in inputs.items():
+            #     pub_inputs[k] = v
+            # pub_inputs["input_ids"] = inputs["null_input_ids"]    
+            # pub_inputs["attention_mask"] = inputs["null_attention_mask"]
+            # pub_inputs["position_ids"] = inputs["null_position_ids"]
+            # if "null_pixel_values" in inputs:
+            #     pub_inputs["pixel_values"] = inputs["null_pixel_values"]
 
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            if is_sagemaker_mp_enabled():
+                raise NotImplementedError("DP currently doesn't support this")
 
-        # Compared to the original HF implementation, we have to remove the loss scaling by the number of gradient
-        # accumulation steps since opacus scales the gradients accordingly. However, we still need to scale the loss
-        # that is returned in order for the logging to work correctly. Hence we scale the loss after the call to 
-        # loss.backward()
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
 
-        if self.use_apex:
-            raise NotImplementedError("DP currently doesn't support this")
-        else:
-            loss.backward()
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
+            if self.use_apex:
+                raise NotImplementedError("DP currently doesn't support this")
+            else:
+                print("Calculating Net Gradients...")
+                loss.backward()
+ 
+            if self.privacy_args.selective_dp:
+                net_grads = [
+                    p.grad_sample.clone() if hasattr(p, "grad_sample") and p.grad_sample is not None else None
+                    for p in model.parameters()
+                ]
+
+                self.optimizer.zero_grad(set_to_none=True)
+
+                inputs["input_ids"] = inputs["null_input_ids"]
+                inputs["attention_mask"] = inputs["null_attention_mask"]
+                inputs["position_ids"] = inputs["null_position_ids"]
+
+                if "null_pixel_values" in inputs:
+                    inputs["pixel_values"] = inputs["null_pixel_values"]
+
+
+                ## PUBLIC GRADIENT CALCULATION:
+                with self.compute_loss_context_manager():
+                    # pub_loss = self.compute_loss(model, pub_inputs)
+                    pub_loss = self.compute_loss(model, inputs)
+
+                if self.args.n_gpu > 1:
+                    pub_loss = pub_loss.mean()  # mean() to average on multi-gpu parallel training
+
+                if self.use_apex:
+                    raise NotImplementedError("DP currently doesn't support this")
+                else:
+                    print("Calculating Public Gradients...")
+                    pub_loss.backward()
+ 
+                pub_grads = [
+                    p.grad_sample.clone() if hasattr(p, "grad_sample") and p.grad_sample is not None else None
+                    for p in model.parameters()
+                ]
+
+                priv_grads = []
+                for a, b in zip(net_grads, pub_grads):
+                    if a is None and b is None:
+                        priv_grads.append(None)
+                    elif a is None:
+                        priv_grads.append(-b)
+                    elif b is None:
+                        priv_grads.append(a)
+                    else:
+                        priv_grads.append(a - b)
+
+                print("Clipping Gradients...")
+
+                pub_grads = self.clip(pub_grads, self.privacy_args.public_clip, microbatch_size)
+                
+                priv_grads = self.clip(priv_grads, self.privacy_args.per_sample_max_grad_norm, microbatch_size)
+
+                grads = []
+                for a,b in zip(pub_grads, priv_grads):
+                    if a is None and b is None:
+                        grads.append(None)
+                    elif a is None:
+                        grads.append(b)
+                    elif b is None:
+                        grads.append(a)
+                    else:
+                        grads.append(a+b)
+
+                for p, g in zip(model.parameters(), grads):
+                    if hasattr(p, "grad_sample"):
+                        p.grad_sample = g
+                    elif g is not None:
+                        raise ValueError("Gradients found for a frozen parameter")
+
+                print("Merged Gradients...")
+            
+            self._accumulate_grad_samples(model)
+            self.optimizer.zero_grad(set_to_none=True)
+            total_loss += loss.detach().item()
+
+        for p, summed in zip(model.parameters(), self._accumulated_grad_samples):
+            if summed is not None:
+                # Average across microbatches
+                p.grad_sample = summed / self.user_grad_acc 
+        
+        self._clear_accumulation_buffers()
+                
         return loss.detach()/self.args.gradient_accumulation_steps
 
     def _get_train_sampler(self):
@@ -299,3 +501,4 @@ class OpacusDPTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
+        

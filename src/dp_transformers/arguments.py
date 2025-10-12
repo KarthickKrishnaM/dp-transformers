@@ -9,14 +9,20 @@ from transformers import TrainingArguments as HfTrainingArguments
 from transformers import IntervalStrategy, logging
 from dataclasses import dataclass, field
 from datasets.utils import disable_progress_bar
-from prv_accountant import Accountant
+
+from scipy import optimize as opt
+
+from dp_accounting import dp_event as event
+from dp_accounting.pld import pld_privacy_accountant as pld
+from dp_accounting.rdp import rdp_privacy_accountant as rdp
 
 logger = logging.get_logger(__name__)
 
 
 @dataclass
 class PrivacyArguments:
-    per_sample_max_grad_norm: Optional[float] = field(default=None, metadata={"help": "Max per sample clip norm"})
+    per_sample_max_grad_norm: Optional[float] = field(default=None, metadata={"help": "Max per sample clip norm for private gradients"})
+    public_clip: Optional[float] = field(default=float("inf"), metadata={"help": "Max per sample clip norm for public gradients"})
     noise_multiplier: Optional[float] = field(default=None, metadata={"help": "Noise multiplier for DP training"})
     target_epsilon: Optional[float] = field(default=None, metadata={
         "help": "Target epsilon at end of training (mutually exclusive with noise multiplier)"
@@ -27,6 +33,9 @@ class PrivacyArguments:
     disable_dp: bool = field(default=False, metadata={
         "help": "Disable DP training."
     })
+    selective_dp: bool = field(default=False, metadata={
+        "help": "Enable Selective DP Algorithm"
+    })
 
     def initialize(self, sampling_probability: float, num_steps: int, num_samples: int) -> None:
         if self.target_delta is None:
@@ -36,8 +45,8 @@ class PrivacyArguments:
         # Set up noise multiplier
         if self.noise_multiplier is None:
             self.noise_multiplier = find_noise_multiplier(
-                sampling_probability=sampling_probability,
-                num_steps=num_steps,
+                sampling=sampling_probability,
+                step=num_steps,
                 target_delta=self.target_delta,
                 target_epsilon=self.target_epsilon
             )
@@ -86,8 +95,7 @@ class TrainingArguments(HfTrainingArguments):
             disable_progress_bar()
 
 
-def find_noise_multiplier(sampling_probability: float, num_steps: int, target_epsilon: float, target_delta: float,
-                          eps_error: float=0.1) -> float:
+def find_noise_multiplier(sampling: float, step: int, target_epsilon: float, target_delta: float,) -> float:
     """
     Find a noise multiplier that satisfies a given target epsilon.
 
@@ -97,45 +105,22 @@ def find_noise_multiplier(sampling_probability: float, num_steps: int, target_ep
     :param float target_delta: Value of DP delta
     :param float eps_error: Error allowed for final epsilon
     """
-    def compute_epsilon(mu: float) -> float:
-        acc = Accountant(
-            noise_multiplier=mu,
-            sampling_probability=sampling_probability,
-            delta=target_delta,
-            max_compositions=num_steps,
-            eps_error=eps_error/2
+    RDP_ORDERS = (
+        [1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5]
+        + list(range(5, 64))
+        + [128, 256, 512]
+    )
+    def objective(noise_multiplier):
+        accountant = rdp.RdpAccountant(RDP_ORDERS)
+        dpevent = event.SelfComposedDpEvent(
+            event.PoissonSampledDpEvent(
+                sampling, event.GaussianDpEvent(noise_multiplier)
+            ),
+            step,
         )
-        return acc.compute_epsilon(num_steps)
+        accountant.compose(dpevent)
+        eps = accountant.get_epsilon(target_delta)
+        return eps - target_epsilon
 
-    mu_max = 100.0
-
-    mu_R = 1.0
-    eps_R = float('inf')
-    while eps_R > target_epsilon:
-        mu_R *= np.sqrt(2)
-        try:
-            eps_R = compute_epsilon(mu_R)[2]
-        except (OverflowError, RuntimeError):
-            pass
-        if mu_R > mu_max:
-            raise RuntimeError("Finding a suitable noise multiplier has not converged. "
-                               "Try increasing target epsilon or decreasing sampling probability.")
-
-    mu_L = mu_R
-    eps_L = eps_R
-    while eps_L < target_epsilon:
-        mu_L /= np.sqrt(2)
-        eps_L = compute_epsilon(mu_L)[0]
-
-    has_converged = False 
-    bracket = [mu_L, mu_R]
-    while not has_converged:
-        mu_err = (bracket[1]-bracket[0])*0.01
-        mu_guess = optimize.root_scalar(lambda mu: compute_epsilon(mu)[2]-target_epsilon, bracket=bracket, xtol=mu_err).root
-        bracket = [mu_guess-mu_err, mu_guess+mu_err]
-        eps_up = compute_epsilon(mu_guess-mu_err)[2]
-        eps_low = compute_epsilon(mu_guess+mu_err)[0]
-        has_converged = (eps_up - eps_low) < 2*eps_error
-    assert compute_epsilon(bracket[1])[2] < target_epsilon + eps_error
-
-    return bracket[1]
+    optimal_noise = opt.brentq(objective, 1e-6, 1000)
+    return optimal_noise

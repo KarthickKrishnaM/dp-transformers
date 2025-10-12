@@ -90,7 +90,7 @@ def main(args: Arguments):
     model = model.to(train_args.device)
 
     # Load data
-    dataset = datasets.load_dataset('reddit', split="train[:500000]").train_test_split(0.02, seed=args.train.seed)
+    dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="train").train_test_split(0.02, seed=args.train.seed)
 
     # Load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model.model_name)
@@ -99,7 +99,7 @@ def main(args: Arguments):
     # Tokenize data
     with train_args.main_process_first(desc="tokenizing dataset"):
         dataset = dataset.map(
-            lambda batch: tokenizer(batch['content'], padding="max_length", truncation=True, max_length=args.model.sequence_len),
+            lambda batch: tokenizer(batch['text'], padding="max_length", truncation=True, max_length=args.model.sequence_len),
             batched=True, num_proc=8, desc="tokenizing dataset", remove_columns=dataset.column_names['train']
         )
 

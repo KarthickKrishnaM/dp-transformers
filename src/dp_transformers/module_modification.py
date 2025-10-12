@@ -29,6 +29,3 @@ def force_causal_attention(model: GPT2Model):
         h_i.attn.bias = torch.tril(h_i.attn.bias)
 
     return model
-
-
-    
