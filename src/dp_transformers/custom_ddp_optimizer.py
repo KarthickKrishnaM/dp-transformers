@@ -54,7 +54,6 @@ class DistributedDPOptimizer(DPOptimizer):
         )
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
-        self.noise_multiplier /= self.world_size
 
     def add_noise(self):
         # Noise only gets added to the first worker
@@ -80,7 +79,7 @@ class DistributedDPOptimizer(DPOptimizer):
                 closure()
 
         if self.pre_step():
-            self.reduce_gradients()
+            self.reduce_gradients() ## Averaging across world size happens after adding noise
             return self.original_optimizer.step()
         else:
             return None

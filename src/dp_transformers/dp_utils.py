@@ -26,6 +26,11 @@ from torch.utils.data import default_collate
 
 logger = logging.get_logger(__name__)
 
+def print_gpu_memory(prefix=""):
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    print(f"{prefix}Allocated: {allocated:.2f} MB | Reserved: {reserved:.2f} MB")
+
 
 class DPCallback(TrainerCallback):
     """
@@ -135,6 +140,107 @@ def create_author_mapping(dataset: Dataset, author: str) -> Sequence[Sequence[in
         author_mapping = [g.index.values for _, g in authors.groupby("author")]
     return author_mapping
 
+class AccLoggingTrainer(Trainer):
+    """
+    Adds per-global-step train accuracy to the default Trainer logs,
+    without changing any existing logging (loss, grad_norm, learning_rate, etc.).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Running window counters since last HF log event
+        self._tr_correct = 0
+        self._tr_total = 0
+
+    # ---- 1) Accumulate correct/total inside compute_loss (no extra forward) ----
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch: torch.Tensor | None = None,
+    ):
+        # Keep a copy for accuracy computation
+        labels_for_acc = inputs.get("labels", None)
+
+        # (Mostly) mirror HF's default compute_loss path, but we keep outputs to get logits
+        # Handle label smoother/custom loss: pop labels before forward if needed
+        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
+        # Forward
+        if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
+            outputs = model(**inputs, num_items_in_batch=num_items_in_batch)
+        else:
+            outputs = model(**inputs)
+
+        # Compute loss
+        if self.compute_loss_func is not None:
+            loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+        elif labels is not None and self.label_smoother is not None:
+            # For classification (your case) this is fine; causal-LM shift not needed here.
+            loss = self.label_smoother(outputs, labels)
+        else:
+            # Standard: model should have put 'loss' in outputs
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss; keys: "
+                    f"{','.join(outputs.keys())}. Inputs were {','.join(inputs.keys())}."
+                )
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # Average-tokens adjustment (kept compatible with HF flag)
+        if (
+            getattr(self.args, "average_tokens_across_devices", False)
+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
+            and num_items_in_batch is not None
+        ):
+            loss *= self.accelerator.num_processes if self.args.n_gpu <= 1 else self.args.n_gpu
+
+        # ---- Accumulate accuracy counters for this forward window (no grad) ----
+        try:
+            if labels_for_acc is not None and hasattr(outputs, "logits"):
+                with torch.no_grad():
+                    preds = outputs.logits.argmax(dim=-1)
+                    if labels_for_acc.shape != preds.shape:
+                        labels_for_acc = labels_for_acc.view_as(preds)
+                    self._tr_correct += int((preds == labels_for_acc).sum().item())
+                    self._tr_total   += int(labels_for_acc.numel())
+        except Exception:
+            # Never let logging math break training
+            pass
+
+        return (loss, outputs) if return_outputs else loss
+
+    # ---- 2) Log train/accuracy right after the base method logs loss/etc. ----
+    def _maybe_log_save_evaluate(
+        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
+    ):
+        prev_last_logged = self._globalstep_last_logged
+        # Run the stock behavior first (this logs loss/grad_norm/learning_rate, runs eval/save, etc.)
+        super()._maybe_log_save_evaluate(
+            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate
+        )
+
+        # If the base method actually logged this step, we add train/accuracy too
+        if self._globalstep_last_logged > prev_last_logged:
+            corr_t = torch.tensor(self._tr_correct, dtype=torch.long, device=self.args.device)
+            tot_t  = torch.tensor(self._tr_total,   dtype=torch.long, device=self.args.device)
+            # Make it global under DDP/Accelerate
+            corr = self.accelerator.gather(corr_t).sum().item()
+            tot  = self.accelerator.gather(tot_t).sum().item()
+
+            if tot > 0:
+                acc = round(corr / float(tot), 4)
+                # Use Trainer's logger so it lands in the same W&B run & step as loss
+                self.log({"accuracy": acc}, start_time)
+
+            # Reset the window for the next logging interval
+            self._tr_correct = 0
+            self._tr_total = 0
+
 class OpacusDPTrainer(Trainer):
     """
     Wrapper to modify Huggingface Trainer to:
@@ -177,30 +283,19 @@ class OpacusDPTrainer(Trainer):
         
         model = GradSampleModule(model)  #makes sure model.parameters has the grad_sample attribute
 
-        # Instantiate privacy accountants
-        # self.rdp_accountant = RDPAccountant()
-        # self.prv_accountant = PRVAccountant(
-        #     noise_multiplier=self.privacy_args.noise_multiplier,
-        #     sampling_probability=self.sampling_probability,
-        #     delta=self.privacy_args.target_delta,
-        #     eps_error=0.1,
-        #     max_compositions=self.num_steps
-        # )
-
         # Set up callback for accounting and handling grad acc
         self.dp_callback = DPCallback(
             noise_multiplier=self.privacy_args.noise_multiplier,
             target_delta=self.privacy_args.target_delta,
             sampling_probability=self.sampling_probability,
             # rdp_accountant=self.rdp_accountant,
-            # prv_accountant=self.prv_accountant
+            # prv_accountant=self.prv_accountant    
         )
+        callbacks_list = kwargs.pop("callbacks", [])
+        callbacks_list = [self.dp_callback, *callbacks_list]
         args.gradient_accumulation_steps = 1
-        super().__init__(model=model, args=args, train_dataset=train_dataset, callbacks=[self.dp_callback], **kwargs)
+        super().__init__(model=model, args=args, train_dataset=train_dataset, callbacks=callbacks_list, **kwargs)
         self._accumulated_grad_samples = None  # will be list of tensors per param or None
-
-        # self.get_rdp_epsilon = lambda: self.rdp_accountant.get_epsilon(self.privacy_args.target_delta)  # RDP epsilon
-        # self.get_prv_epsilon = lambda: self.prv_accountant.compute_epsilon(self.state.global_step)[2]
 
     @property
     def sampling_probability(self) -> float:
@@ -208,7 +303,7 @@ class OpacusDPTrainer(Trainer):
 
     @property
     def num_steps(self) -> int:
-        return int(self.train_args.num_train_epochs * (1 / self.sampling_probability + 1))
+        return int(self.train_args.num_train_epochs * (1 / self.sampling_probability))
 
     def create_optimizer(self):
         _ = super().create_optimizer()
@@ -226,8 +321,10 @@ class OpacusDPTrainer(Trainer):
             expected_batch_size=self.args.per_device_train_batch_size,
             selective_dp=self.privacy_args.selective_dp,
             gradient_accumulation_steps=self.train_args.gradient_accumulation_steps, #still actual gradient_acc steps
+            loss_reduction="sum",
         )
 
+        print("Created Optimizer with Sigma:", self.optimizer.noise_multiplier)
         return self.optimizer
     
     def clip(self, grad_sample, max_norm, batch_size):
@@ -348,9 +445,10 @@ class OpacusDPTrainer(Trainer):
             :obj:`torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
-
         microbatches = self._split_batch(inputs, self.user_grad_acc)
         self._init_accumulation_buffers(model)
+        print("Created Microbatches")
+        print_gpu_memory()
 
         total_loss = 0.0
         for inputs in microbatches:
@@ -359,37 +457,38 @@ class OpacusDPTrainer(Trainer):
                     print(f"nan param {name}")
             inputs = self._prepare_inputs(inputs)
             microbatch_size = inputs["labels"].shape[0]
-            # pub_inputs = dict()
-            # for k, v in inputs.items():
-            #     pub_inputs[k] = v
-            # pub_inputs["input_ids"] = inputs["null_input_ids"]    
-            # pub_inputs["attention_mask"] = inputs["null_attention_mask"]
-            # pub_inputs["position_ids"] = inputs["null_position_ids"]
-            # if "null_pixel_values" in inputs:
-            #     pub_inputs["pixel_values"] = inputs["null_pixel_values"]
 
             if is_sagemaker_mp_enabled():
                 raise NotImplementedError("DP currently doesn't support this")
 
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
+                print("Computed Net Loss")
+                print_gpu_memory()
 
             if self.args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                loss = loss.mean()  # mean() to average as reduction is none
 
             if self.use_apex:
                 raise NotImplementedError("DP currently doesn't support this")
             else:
                 print("Calculating Net Gradients...")
                 loss.backward()
- 
-            if self.privacy_args.selective_dp:
-                net_grads = [
+                print_gpu_memory()
+            
+            net_grads = [
                     p.grad_sample.clone() if hasattr(p, "grad_sample") and p.grad_sample is not None else None
                     for p in model.parameters()
                 ]
+            print("Stored Net Grads")
+            print_gpu_memory()
+ 
+            if self.privacy_args.selective_dp:
 
                 self.optimizer.zero_grad(set_to_none=True)
+                print("Cleared Net Grads")
+                print_gpu_memory()
+
 
                 inputs["input_ids"] = inputs["null_input_ids"]
                 inputs["attention_mask"] = inputs["null_attention_mask"]
@@ -403,6 +502,9 @@ class OpacusDPTrainer(Trainer):
                 with self.compute_loss_context_manager():
                     # pub_loss = self.compute_loss(model, pub_inputs)
                     pub_loss = self.compute_loss(model, inputs)
+                    print("Computed Public Loss")
+                    print_gpu_memory()
+
 
                 if self.args.n_gpu > 1:
                     pub_loss = pub_loss.mean()  # mean() to average on multi-gpu parallel training
@@ -412,11 +514,16 @@ class OpacusDPTrainer(Trainer):
                 else:
                     print("Calculating Public Gradients...")
                     pub_loss.backward()
+                    print_gpu_memory()
+
  
                 pub_grads = [
                     p.grad_sample.clone() if hasattr(p, "grad_sample") and p.grad_sample is not None else None
                     for p in model.parameters()
                 ]
+                print("Stored Pub Grads")
+                print_gpu_memory()
+
 
                 priv_grads = []
                 for a, b in zip(net_grads, pub_grads):
@@ -453,19 +560,28 @@ class OpacusDPTrainer(Trainer):
                         raise ValueError("Gradients found for a frozen parameter")
 
                 print("Merged Gradients...")
+
+            else:
+                net_grads = self.clip(net_grads, self.privacy_args.per_sample_max_grad_norm, microbatch_size)
+                print("Clipped Net Grads")
+                for p, g in zip(model.parameters(), net_grads):
+                    if hasattr(p, "grad_sample"):
+                        p.grad_sample = g
+                    elif g is not None:
+                        raise ValueError("Gradients found for a frozen parameter")
             
             self._accumulate_grad_samples(model)
-            self.optimizer.zero_grad(set_to_none=True)
-            total_loss += loss.detach().item()
+            # self.optimizer.zero_grad(set_to_none=True)
+            total_loss += loss.detach()#/microbatch_size
 
         for p, summed in zip(model.parameters(), self._accumulated_grad_samples):
             if summed is not None:
-                # Average across microbatches
+                # No need to average across microbatches, done by optimizer
                 p.grad_sample = summed / self.user_grad_acc 
         
         self._clear_accumulation_buffers()
                 
-        return loss.detach()/self.args.gradient_accumulation_steps
+        return total_loss/self.user_grad_acc
 
     def _get_train_sampler(self):
         """
@@ -501,4 +617,3 @@ class OpacusDPTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
-        

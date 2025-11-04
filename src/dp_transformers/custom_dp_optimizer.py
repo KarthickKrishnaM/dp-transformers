@@ -241,7 +241,7 @@ class DPOptimizer(Optimizer):
         self.max_grad_norm = max_grad_norm
         self.loss_reduction = loss_reduction
         self.expected_batch_size = expected_batch_size
-        self.noise_multiplier = noise_multiplier/self.expected_batch_size
+        self.noise_multiplier = noise_multiplier
         self.step_hook = None
         self.generator = generator
         self.secure_mode = secure_mode
@@ -349,35 +349,35 @@ class DPOptimizer(Optimizer):
             ret.append(self._get_flat_grad_sample(p))
         return ret
 
-    @property
-    def accumulated_iterations(self) -> int:
-        """
-        Returns number of batches currently accumulated and not yet processed.
+    # @property
+    # def accumulated_iterations(self) -> int:
+    #     """
+    #     Returns number of batches currently accumulated and not yet processed.
 
-        In other words ``accumulated_iterations`` tracks the number of forward/backward
-        passed done in between two optimizer steps. The value would typically be 1,
-        but there are possible exceptions.
+    #     In other words ``accumulated_iterations`` tracks the number of forward/backward
+    #     passed done in between two optimizer steps. The value would typically be 1,
+    #     but there are possible exceptions.
 
-        Used by privacy accountants to calculate real sampling rate.
-        """
-        vals = []
-        for p in self.params:
-            if not hasattr(p, "grad_sample"):
-                raise ValueError(
-                    "Per sample gradient not found. Are you using GradSampleModule?"
-                )
-            if isinstance(p.grad_sample, torch.Tensor):
-                vals.append(1)
-            elif isinstance(p.grad_sample, list):
-                vals.append(len(p.grad_sample))
-            else:
-                raise ValueError(f"Unexpected grad_sample type: {type(p.grad_sample)}")
+    #     Used by privacy accountants to calculate real sampling rate.
+    #     """
+    #     vals = []
+    #     for p in self.params:
+    #         if not hasattr(p, "grad_sample"):
+    #             raise ValueError(
+    #                 "Per sample gradient not found. Are you using GradSampleModule?"
+    #             )
+    #         if isinstance(p.grad_sample, torch.Tensor):
+    #             vals.append(1)
+    #         elif isinstance(p.grad_sample, list):
+    #             vals.append(len(p.grad_sample))
+    #         else:
+    #             raise ValueError(f"Unexpected grad_sample type: {type(p.grad_sample)}")
 
-        if len(set(vals)) > 1:
-            raise ValueError(
-                "Number of accumulated steps is inconsistent across parameters"
-            )
-        return vals[0]
+    #     if len(set(vals)) > 1:
+    #         raise ValueError(
+    #             "Number of accumulated steps is inconsistent across parameters"
+    #         )
+    #     return vals[0]
 
     @property
     def param_groups(self) -> List[dict]:
@@ -443,20 +443,20 @@ class DPOptimizer(Optimizer):
             per_sample_clip_factor = torch.zeros(
                 (0,), device=self.grad_samples[0].device
             )
-        elif self.selective_dp:
+        else:
             per_sample_clip_factor = torch.ones(
                 (len(self.grad_samples[0]),), device=self.grad_samples[0].device
                 )
-        else:
-            # for i in self.grad_samples:
-                # print(i.shape)
-            per_param_norms = [
-                g.reshape(len(g), -1).norm(2, dim=-1) for g in self.grad_samples
-            ]
-            per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
-            per_sample_clip_factor = (
-                self.max_grad_norm / (per_sample_norms + 1e-6)
-            ).clamp(max=1.0)        
+        # else:
+        #     # for i in self.grad_samples:
+        #         # print(i.shape)
+        #     per_param_norms = [
+        #         g.reshape(len(g), -1).norm(2, dim=-1) for g in self.grad_samples
+        #     ]
+        #     per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
+        #     per_sample_clip_factor = (
+        #         self.max_grad_norm / (per_sample_norms + 1e-6)
+        #     ).clamp(max=1.0)        
         for p in self.params:
             _check_processed_flag(p.grad_sample)
             grad_sample = self._get_flat_grad_sample(p)
@@ -501,8 +501,9 @@ class DPOptimizer(Optimizer):
         ``self.expected_batch_size`` if ``loss_reduction="mean"``
         """
         if self.loss_reduction == "mean":
+            print("Scaling Grads")
             for p in self.params:
-                p.grad /= self.expected_batch_size * self.accumulated_iterations
+                p.grad /= self.expected_batch_size #* self.accumulated_iterations
 
     def zero_grad(self, set_to_none: bool = False):
         """
